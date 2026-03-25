@@ -4,7 +4,7 @@
 
     <div style="display:flex; gap:6px; margin-bottom:10px;">
       <input v-model="query" @keyup.enter="search"
-        placeholder="pikachu, eevee..."
+        placeholder="pikachu, eevee, 078/066..."
         style="flex:1; border:2px solid #ffadd1; border-radius:20px; padding:7px 12px;
                font-family:Comic Sans MS,cursive; font-size:12px; outline:none; color:#d63384;" />
       <button @click="search"
@@ -68,20 +68,132 @@ watch(query, (val) => {
   debounceTimer = setTimeout(() => search(), 500)
 })
 
+function parseNumberSearch(input) {
+  const trimmed = input.trim()
+  const match = trimmed.match(/^(\d+)(?:\/(\d+))?$/)
+  if (match) return { localId: match[1], total: match[2] ?? null }
+  if (trimmed.includes('/')) {
+    const [a, b] = trimmed.split('/')
+    return { localId: a, total: b ?? null }
+  }
+  return null
+}
+
+// ── pokemontcg.io (English sets, proxied via /tcg/) ──────────────────────────
+async function searchTCG(input) {
+  const trimmed = input.trim()
+  const numSearch = parseNumberSearch(trimmed)
+  let q
+
+  if (numSearch) {
+    const num = parseInt(numSearch.localId, 10)
+    q = `number:${num}`
+  } else {
+    q = `name:${trimmed}`
+  }
+
+  const res = await fetch(`/tcg/v2/cards?q=${encodeURIComponent(q)}&pageSize=20`)
+  if (!res.ok) throw new Error(`TCG HTTP ${res.status}`)
+  const data = await res.json()
+  return (data.data || []).map(card => ({
+    id: card.id,
+    name: card.name,
+    images: { small: card.images?.small }
+  })).filter(c => c.images.small)
+}
+
+// ── TCGdex (Japanese + newer sets, proxied via /tcgdex/) ─────────────────────
+async function searchTCGdex(input) {
+  const trimmed = input.trim()
+  const numSearch = parseNumberSearch(trimmed)
+
+  if (numSearch && numSearch.total) {
+    // Has both number and set total (e.g. "078/066") — resolve exact set
+    const setsRes = await fetch(`/tcgdex/v2/en/sets`)
+    if (!setsRes.ok) throw new Error(`TCGdex sets HTTP ${setsRes.status}`)
+    const sets = await setsRes.json()
+
+    const localId = numSearch.localId.replace(/^0+/, '')
+    const total = parseInt(numSearch.total, 10)
+
+    const matchingSets = (Array.isArray(sets) ? sets : [])
+      .filter(s => s.cardCount?.official === total || s.cardCount?.total === total)
+
+    const cardPromises = matchingSets.map(async (s) => {
+      try {
+        const r = await fetch(`/tcgdex/v2/en/sets/${s.id}/${localId}`)
+        if (!r.ok) return null
+        const card = await r.json()
+        if (!card.image) return null
+        return {
+          id: `tcgdex-${card.id}`,
+          name: card.name ?? trimmed,
+          images: { small: `${card.image}/low.webp` }
+        }
+      } catch { return null }
+    })
+
+    const cards = (await Promise.all(cardPromises)).filter(Boolean)
+    if (cards.length > 0) return cards
+  }
+
+  if (numSearch) {
+    // Number only, no set total
+    const localId = numSearch.localId.replace(/^0+/, '')
+    const res = await fetch(`/tcgdex/v2/en/cards?localId=${localId}`)
+    if (!res.ok) throw new Error(`TCGdex HTTP ${res.status}`)
+    const data = await res.json()
+    return (Array.isArray(data) ? data : [])
+      .filter(c => c.image)
+      .slice(0, 20)
+      .map(c => ({ id: `tcgdex-${c.id}`, name: c.name ?? trimmed, images: { small: `${c.image}/low.webp` } }))
+  }
+
+  // Name search — fetch ALL results then sort newest first so ARs/SARs bubble up
+  const res = await fetch(`/tcgdex/v2/en/cards?name=${encodeURIComponent(trimmed)}`)
+  if (!res.ok) throw new Error(`TCGdex HTTP ${res.status}`)
+  const data = await res.json()
+
+  return (Array.isArray(data) ? data : [])
+    .filter(c => c.image)
+    // Sort by set id descending (sv* sets sort after older sets) and by
+    // localId descending so higher card numbers (AR/SAR) come first within a set
+    .sort((a, b) => {
+      const setA = a.id?.split('-')[0] ?? ''
+      const setB = b.id?.split('-')[0] ?? ''
+      if (setB !== setA) return setB.localeCompare(setA)
+      const numA = parseInt(a.localId ?? a.id?.split('-')[1] ?? 0)
+      const numB = parseInt(b.localId ?? b.id?.split('-')[1] ?? 0)
+      return numB - numA
+    })
+    .slice(0, 60) // get plenty so newer cards aren't cut off
+    .map(c => ({ id: `tcgdex-${c.id}`, name: c.name ?? trimmed, images: { small: `${c.image}/low.webp` } }))
+}
+
 async function search() {
   if (!query.value.trim()) return
   loading.value = true
   searched.value = true
   results.value = []
+
   try {
-    const url = `/tcg/v2/cards?q=name:${encodeURIComponent(query.value)}&pageSize=20`
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`HTTP error: ${res.status}`)
-    const data = await res.json()
-    results.value = data.data || []
+    // Run both APIs in parallel for speed
+    const [tcgCards, tcgdexCards] = await Promise.allSettled([
+      searchTCG(query.value),
+      searchTCGdex(query.value)
+    ])
+
+    const english = tcgCards.status === 'fulfilled' ? tcgCards.value : []
+    const all = tcgdexCards.status === 'fulfilled' ? tcgdexCards.value : []
+
+    // TCGdex results first (newer cards, Japanese), then English-only cards
+    const tcgdexIds = new Set(all.map(c => c.id))
+    const englishOnly = english.filter(c => !tcgdexIds.has(c.id))
+    results.value = [...all, ...englishOnly]
   } catch (e) {
-    console.error('Error fetching cards:', e)
+    console.error('Search error:', e)
   }
+
   loading.value = false
 }
 </script>

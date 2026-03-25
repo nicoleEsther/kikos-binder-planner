@@ -4,6 +4,25 @@ import axios from 'axios'
 const cache = {}
 const PAGE_SIZE = 8
 
+function buildQuery(input) {
+  const trimmed = input.trim()
+
+  // Matches formats like "078/066", "078/185", or just "078"
+  const numberOnly = /^(\d+)(\/\d+)?$/.test(trimmed)
+  const hasSlash = trimmed.includes('/')
+
+  if (numberOnly || hasSlash) {
+    const numPart = trimmed.split('/')[0]
+    const num = parseInt(numPart, 10) // strip leading zeros e.g. "078" → 78
+    // Note: we intentionally ignore the "/066" total — Art Rares (AR) and
+    // Special Art Rares (SAR) have card numbers HIGHER than the set total,
+    // so filtering by total would exclude them.
+    return `number:${num}`
+  }
+
+  return `name:${trimmed}`
+}
+
 function CardSearch({ onCardSelect }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
@@ -29,16 +48,17 @@ function CardSearch({ onCardSelect }) {
     setPage(0)
 
     try {
+      const q = buildQuery(query)
+      // Uses the same pokemontcg.io API as the Vue version (proxied via /tcg/)
       const res = await axios.get(
-        `https://api.tcgdex.net/v2/en/cards?name=${query}`
+        `/tcg/v2/cards?q=${encodeURIComponent(q)}&pageSize=40`
       )
-      const cards = res.data
-        .filter(card => card.image)
-        .slice(0, 40)
+      const cards = (res.data.data || [])
+        .filter(card => card.images?.small)
         .map(card => ({
           id: card.id,
-          name: card.name ?? query,
-          images: { small: `${card.image}/low.webp` }
+          name: card.name,
+          images: { small: card.images.small }
         }))
       cache[query] = cards
       setResults(cards)
@@ -55,7 +75,7 @@ function CardSearch({ onCardSelect }) {
       <div className="flex gap-2 mb-4">
         <input
           className="border-2 border-pink-300 rounded-full px-4 py-2 w-full focus:outline-none focus:border-pink-500"
-          placeholder="Search a Pokémon card... 🌸"
+          placeholder="Search by name or number (e.g. pikachu, 078/066)... 🌸"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && searchCards()}
